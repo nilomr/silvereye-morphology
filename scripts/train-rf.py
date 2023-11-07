@@ -4,68 +4,174 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.cluster import hierarchy as sch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import permutation_test_score, train_test_split
+from tqdm.autonotebook import tqdm
 
 # get the repo root dir
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
+FIG_DIR = ROOT_DIR / "figures"
+
+for d in [DATA_DIR, FIG_DIR]:
+    if not d.exists():
+        d.mkdir()
 
 
 # Import morphological data
-df = pd.read_csv(DATA_DIR / "raw" / "morph-df.csv").drop(columns=["sample_name"])
+df = pd.read_csv(DATA_DIR / "raw" / "morph-df.csv")
 df.columns = df.columns.str.lower()
+
+# Drop unnecessary columns
+df.drop(columns=["sample_name", "pop"], inplace=True)
+
+# rename 'pop_state' to 'population'
+df.rename(columns={"pop_state": "population"}, inplace=True)
+# remove underscores from population names
+df["population"] = df["population"].str.replace("_", " ")
 
 # Drop rows with missing values
 df = df.dropna()
 
+# Remove populations with < 5 samples
+pop_counts = df["population"].value_counts()
+df = df[df["population"].isin(pop_counts[pop_counts >= 5].index)]
+
+
 # Get and plot the distribution of sample sizes of the target variable using
 # seaborn, arrange the values in descending order
-pop_counts = df["pop"].value_counts().sort_values(ascending=False)
+pop_counts = df["population"].value_counts().sort_values(ascending=False)
 sns.barplot(x=pop_counts.index, y=pop_counts)
-# rotate labels
-plt.xticks(rotation=45)
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
 plt.show()
 
 
-X = df.drop(columns=["pop"])
-y = df["pop"]
+n_classes = len(df["population"].unique())
+confusion_matrix_avg = np.zeros((n_classes, n_classes))
+
+nits = 100
+feature_importances = np.zeros((nits, len(df.columns) - 1))
+
+for i in tqdm(range(nits)):
+    # Resample all classes to the same number of samples (15), with replacement
+    X = df.groupby("population").apply(lambda x: x.sample(15, replace=True))
+    X = X.droplevel(0)
+    y = X["population"]
+    X = X.drop(columns=["population"])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.33, random_state=i, stratify=y
+    )
+    rf = RandomForestClassifier(n_estimators=500)
+    rf.fit(X_train, y_train)
+    y_pred = rf.predict(X_test)
+    cm = confusion_matrix(y_test, y_pred, normalize="true")
+    # add the values to the corresponding indices in the larger array
+    confusion_matrix_avg += cm
+    feature_importances[i, :] = rf.feature_importances_
+
+confusion_matrix_avg /= nits
 
 
-# n_classes = len(df["pop"].unique())
-# confusion_matrix_avg = np.zeros((n_classes -1, n_classes-1))
+# use the permutation_test_score function to get the accuracy of the model
+# using the test data
+score, permutation_scores, pvalue = permutation_test_score(
+    rf, X_test, y_test, scoring="accuracy", n_jobs=-1, n_permutations=100
+)
 
-# for i in range(100):
-#     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=i)
-#     rf = RandomForestClassifier(n_estimators=1000)
-#     rf.fit(X_train, y_train)
-#     y_pred = rf.predict(X_test)
-#     confusion_matrix_avg += confusion_matrix(y_test, y_pred, normalize="true")
+# now plot the distribution of the permutation scores and the actual score
+fig, ax = plt.subplots(figsize=(6, 3))
+sns.set_theme()
+sns.histplot(
+    permutation_scores,
+    kde=True,
+    stat="density",
+    edgecolor="none",
+    bins=10,
+    label="Permutation scores",
+)
+plt.axvline(score, color="red", linestyle="--", label="Model accuracy")
+plt.xlabel("Accuracy score")
+plt.ylabel("Density")
+plt.xlim(left=0)
+plt.legend()
+sns.despine()
 
-# confusion_matrix_avg /= 100
+# save plot as a pdf
+plt.savefig(
+    FIG_DIR / "permutation-test-score.pdf",
+    bbox_inches="tight",
+    transparent=True,
+)
 
 
-# Train a random forest classifier with 'pop' as the target
+# plot the confusion matrix as a heatmap ordered by how often samples are misclassified
+# between populations
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33)
+cm = confusion_matrix_avg
 
-rf = RandomForestClassifier(n_estimators=1000)
-rf.fit(X_train, y_train)
+# Perform hierarchical clustering on the confusion matrix
+d = sch.distance.pdist(cm)
+L = sch.linkage(d, method="complete")
+ind = sch.fcluster(L, 0.5 * d.max(), "distance")
 
-y_pred = rf.predict(X_test)
-print(accuracy_score(y_test, y_pred))
+# Reorder the confusion matrix based on the clustering
+cm_df = pd.DataFrame(cm, index=rf.classes_, columns=rf.classes_)
+new_index = cm_df.index[np.argsort(ind)]
+cm_df = cm_df.reindex(index=new_index, columns=new_index)
+
+# get the new order of the populations for the x and y tick labels
+new_order_x = cm_df.columns
+new_order_y = cm_df.index
+
+fig, ax = plt.subplots(figsize=(8, 8))
+g = sns.heatmap(
+    cm_df,
+    annot=True,
+    fmt=".0%",
+    xticklabels=new_order_x,
+    yticklabels=new_order_y,
+    linewidth=0.5,
+    annot_kws={"fontsize": 8},
+    square=True,  # set square parameter to True
+)
+
+# add predicted and true labels to the plot
+g.set_xlabel("Predicted population")
+g.set_ylabel("Actual population")
+# remove colorbar
+g.collections[0].colorbar.remove()
+
+# save plot as a pdf
+plt.savefig(
+    FIG_DIR / "confusion-matrix.pdf",
+    bbox_inches="tight",
+    transparent=True,
+)
+
 
 # plot a confusion matrix using seaborn with a dendrogram that shows the hierarchical
 # clustering of the populations based on how often samples are misclassified
 
-cm = confusion_matrix(y_test, y_pred, normalize="true")
+cm = confusion_matrix_avg * 100
 g = sns.clustermap(
-    cm, annot=True, col_cluster=False, xticklabels=rf.classes_, yticklabels=rf.classes_
+    cm,
+    annot=True,
+    fmt=".0f",  # modify fmt parameter to remove percentage sign
+    col_cluster=True,
+    row_cluster=True,
+    xticklabels=rf.classes_,
+    yticklabels=rf.classes_,
+    cmap="YlGnBu",
+    tree_kws=dict(linewidths=1.5),
+    annot_kws={"fontsize": 9},
 )
 
 bbox = g.ax_heatmap.get_position()
-space = 0.15
+space = 0.18
 g.ax_heatmap.set_position([bbox.x0 + space, bbox.y0, bbox.width, bbox.height])
 
 # left align the y label text using set_yticklabels ha="left"
@@ -73,14 +179,62 @@ g.ax_heatmap.set_yticklabels(
     g.ax_heatmap.get_yticklabels(), rotation=0, ha="left", va="center"
 )
 # offset y labels by 10 pt
-g.ax_heatmap.tick_params(axis="y", pad=90)
-
+g.ax_heatmap.tick_params(axis="y", pad=100)
 g.ax_heatmap.yaxis.tick_left()
 plt.gcf().axes[-1].set_visible(False)
-plt.show()
+
+# remove the top dendrogram
+g.ax_col_dendrogram.set_visible(False)
+g.ax_heatmap.tick_params(left=False, bottom=False)
+
+# save plot as a pdf
+plt.savefig(
+    FIG_DIR / "confusion-matrix-clustermap.pdf",
+    bbox_inches="tight",
+    transparent=True,
+)
 
 
-# get the feature importances and plot them using seaborn
-feature_importances = pd.Series(rf.feature_importances_, index=X.columns)
-sns.barplot(x=feature_importances, y=feature_importances.index)
-plt.show()
+# plot the feature importances as a categorical scatterplot with a bar at the
+# mean
+feature_importances_df = pd.DataFrame(feature_importances, columns=X.columns)
+feature_importances_df = feature_importances_df.melt(
+    var_name="Feature", value_name="Importance"
+)
+feature_importances_df["Importance"] *= 100
+feature_importances_df["Feature"] = (
+    feature_importances_df["Feature"]
+    .str.replace("_", " ")
+    .str.replace("headlength", "head\nlength")
+    .str.replace(" ", "\n")
+    .str.replace("(", "\n(")
+    .str.replace(")", "")
+)
+
+fig, ax = plt.subplots(figsize=(8, 8))
+sns.stripplot(
+    x="Importance",
+    y="Feature",
+    data=feature_importances_df,
+    orient="h",
+    color="black",
+    size=3,
+    ax=ax,
+)
+
+# add a bar at the mean of each feature
+means = feature_importances_df.groupby("Feature").mean().reset_index()
+ax.barh(means["Feature"], means["Importance"], color="#46848f", alpha=0.5, label="Mean")
+
+ax.legend()
+ax.set_xlabel("Importance (%)")
+ax.set_ylabel("Feature")
+sns.despine()
+
+
+# save as a pdf
+plt.savefig(
+    FIG_DIR / "feature-importances.pdf",
+    bbox_inches="tight",
+    transparent=True,
+)
