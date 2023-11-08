@@ -1,14 +1,20 @@
+# ──── IMPORTS ────────────────────────────────────────────────────────────────
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from rasterio import pad
 from scipy.cluster import hierarchy as sch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.model_selection import permutation_test_score, train_test_split
 from tqdm.autonotebook import tqdm
+
+# ──── DATA INGEST ────────────────────────────────────────────────────────────
+
 
 # get the repo root dir
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -40,13 +46,14 @@ pop_counts = df["population"].value_counts()
 df = df[df["population"].isin(pop_counts[pop_counts >= 5].index)]
 
 
-# Get and plot the distribution of sample sizes of the target variable using
-# seaborn, arrange the values in descending order
-pop_counts = df["population"].value_counts().sort_values(ascending=False)
-sns.barplot(x=pop_counts.index, y=pop_counts)
-plt.xticks(rotation=45, ha="right")
-plt.tight_layout()
-plt.show()
+# ──── TRAIN THE CLASSIFIER ───────────────────────────────────────────────────
+
+# To get around the class imbalance, we will resample the data with replacement
+# so that each population has the same number of samples. We will then train a
+# random forest classifier on the resampled data and use the test data to
+# evaluate the model. We will repeat this process 100 times and average the
+# confusion matrices to get a better estimate of the model's performance on
+# random subsets.
 
 
 n_classes = len(df["population"].unique())
@@ -57,15 +64,18 @@ feature_importances = np.zeros((nits, len(df.columns) - 1))
 
 for i in tqdm(range(nits)):
     # Resample all classes to the same number of samples (15), with replacement
-    X = df.groupby("population").apply(lambda x: x.sample(15, replace=True))
-    X = X.droplevel(0)
+    X = (
+        df.groupby("population")
+        .apply(lambda x: x.sample(15, replace=True))
+        .droplevel(0)
+    )
     y = X["population"]
     X = X.drop(columns=["population"])
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.33, random_state=i, stratify=y
+        X, y, test_size=0.4, random_state=i
     )
-    rf = RandomForestClassifier(n_estimators=500)
+    rf = RandomForestClassifier(n_estimators=100)
     rf.fit(X_train, y_train)
     y_pred = rf.predict(X_test)
     cm = confusion_matrix(y_test, y_pred, normalize="true")
@@ -76,28 +86,54 @@ for i in tqdm(range(nits)):
 confusion_matrix_avg /= nits
 
 
-# use the permutation_test_score function to get the accuracy of the model
-# using the test data
+# Now we train a random forest classifier with all the data in df
+
+X = df.drop(columns=["population"])
+y = df["population"]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=0)
+
+rf = RandomForestClassifier(n_estimators=100)
+rf.fit(X_train, y_train)
+y_pred = rf.predict(X_test)
+
+# get accuracy score
+score = accuracy_score(y_test, y_pred)
+print(f"Accuracy score: {score:.2f}")
+
+
 score, permutation_scores, pvalue = permutation_test_score(
-    rf, X_test, y_test, scoring="accuracy", n_jobs=-1, n_permutations=100
+    rf,
+    X_test,
+    y_test,
+    scoring="accuracy",
+    n_jobs=-1,
+    n_permutations=200,
+    random_state=42,
+    verbose=2,
 )
 
+# print results of permutation test in the same line
+print(f"Permutation test score: {score:.2f}, p-value: {pvalue:.5f}")
+
+
 # now plot the distribution of the permutation scores and the actual score
-fig, ax = plt.subplots(figsize=(6, 3))
 sns.set_theme()
+fig, ax = plt.subplots(figsize=(6, 3))
 sns.histplot(
     permutation_scores,
     kde=True,
     stat="density",
     edgecolor="none",
-    bins=10,
+    bins=15,
     label="Permutation scores",
 )
 plt.axvline(score, color="red", linestyle="--", label="Model accuracy")
 plt.xlabel("Accuracy score")
 plt.ylabel("Density")
 plt.xlim(left=0)
+plt.ylim(bottom=0, top=35)
 plt.legend()
+ax.legend(frameon=False, loc="upper left")
 sns.despine()
 
 # save plot as a pdf
@@ -108,8 +144,8 @@ plt.savefig(
 )
 
 
-# plot the confusion matrix as a heatmap ordered by how often samples are misclassified
-# between populations
+# plot the confusion matrix as a heatmap ordered by how often samples are
+# misclassified between populations
 
 cm = confusion_matrix_avg
 
@@ -131,7 +167,7 @@ fig, ax = plt.subplots(figsize=(8, 8))
 g = sns.heatmap(
     cm_df,
     annot=True,
-    fmt=".0%",
+    fmt=".01f",
     xticklabels=new_order_x,
     yticklabels=new_order_y,
     linewidth=0.5,
@@ -187,6 +223,17 @@ plt.gcf().axes[-1].set_visible(False)
 g.ax_col_dendrogram.set_visible(False)
 g.ax_heatmap.tick_params(left=False, bottom=False)
 
+# Add predicted and true labels to the plot, at the top of the x axis and on the
+# right of the y axis
+g.ax_heatmap.set_xlabel("Predicted population", fontsize=12, labelpad=10)
+g.ax_heatmap.xaxis.set_label_position("top")
+g.ax_heatmap.set_ylabel("Actual population", fontsize=12)
+g.ax_heatmap.yaxis.set_label_position("right")
+# flip y axis label 180 degrees
+g.ax_heatmap.set_ylabel(
+    g.ax_heatmap.get_ylabel(), rotation=-90, fontsize=12, labelpad=20
+)
+
 # save plot as a pdf
 plt.savefig(
     FIG_DIR / "confusion-matrix-clustermap.pdf",
@@ -221,11 +268,9 @@ sns.stripplot(
     size=3,
     ax=ax,
 )
-
 # add a bar at the mean of each feature
 means = feature_importances_df.groupby("Feature").mean().reset_index()
 ax.barh(means["Feature"], means["Importance"], color="#46848f", alpha=0.5, label="Mean")
-
 ax.legend()
 ax.set_xlabel("Importance (%)")
 ax.set_ylabel("Feature")
